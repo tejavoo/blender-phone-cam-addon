@@ -1,0 +1,331 @@
+# Cam Link Pro
+
+> Blender 4.x/5.x add-on. Receives a live 6DOF camera pose (position +
+> rotation + focal length + sensor width) over the network from a
+> companion Android AR app, drives a target Camera object with it in
+> real time, records takes to keyframes, and mixes takes on the NLA. A
+> second TCP channel streams a live JPEG monitor of the driven camera's
+> view back to the sender and accepts remote record commands.
+
+This file is a compact, structured reference for an AI assistant
+working with this add-on or its companion phone app's source. It states
+facts and exact identifiers rather than narrative explanation — see
+`README.md` in this same directory for the human-readable walkthrough.
+
+## System shape
+
+Two halves, communicating over two independent connections on the same
+LAN:
+
+- **This add-on** (`cam_link_pro/`, Blender-side): a UDP receiver for
+  pose data, a TCP server for video+commands, an NLA baking/mixing
+  workflow, and a sidebar panel.
+- **A companion phone app** (Unity + AR Foundation, Android; not part
+  of this package): reads AR tracking, runs a pose-processing pipeline,
+  sends UDP pose packets, and opens the TCP video/command connection.
+  Its spec and reference C# source may exist alongside this add-on in a
+  sibling project (`PoseMath.cs`, `CamLinkTrackerDriver.cs`,
+  `CamLinkClient.cs`, `CAMLINK_APP_SPEC.md`) — if you're asked about
+  that side of the system and those files aren't in front of you, say
+  so rather than guessing at Unity/AR Foundation specifics.
+
+Do not assume the phone app exists or is reachable when reasoning about
+this add-on in isolation — every wire contract below is the *complete*
+interface between the two; nothing else is shared (no filesystem, no
+shared process, no other side channel).
+
+## File map
+
+- `__init__.py` — `bl_info`, `CamLinkProSettings` (PropertyGroup on
+  `Scene.cam_link_pro`), all operators, `VIEW3D_PT_cam_link_pro` panel,
+  `WM_OT_camera_stream_server` (the UDP modal server — this is the
+  core loop, see below).
+- `video_channel.py` — `VideoCommandServer` (TCP accept/read/write
+  threads + two queues), `capture_frame_jpeg()` (main-thread-only
+  OpenGL viewport capture → JPEG bytes), pairing string/QR helpers,
+  `local_lan_ip()`.
+- `qr_gen.py` — dependency-free QR matrix + PNG encoder.
+- `README.md` — human-facing docs.
+- `llms.txt` — this file.
+
+## Wire contracts (exact, do not paraphrase when implementing against these)
+
+### Pose (UDP, phone → Blender)
+One packet per pose update, fire-and-forget, no ack/retry.
+```
+sequence_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,focal_length_mm,sensor_width_mm
+```
+- 9 comma-separated ASCII fields, no spaces.
+- `sequence_id`: non-negative int, monotonically increasing for the
+  life of the connection (not restarted at reconnect). Receiver drops
+  any packet whose id is `< last_packet_id` applied
+  (`WM_OT_camera_stream_server.last_packet_id`).
+- `pos_x/y/z`: metres, already Blender space (right-handed, Z-up).
+- `rot_x/y/z`: degrees, already Blender's default XYZ Euler order
+  (`R = Rz · Ry · Rx`).
+- `focal_length_mm`, `sensor_width_mm`: floats.
+- Receiver: `WM_OT_camera_stream_server._parse_packet()` /
+  `_drain_and_apply()`. Malformed lines (wrong field count, non-numeric)
+  are silently dropped, never raised.
+- Default port `5005`, configurable via `settings.port`.
+
+### Video + command (TCP, both directions)
+Single persistent connection, port `5006` default
+(`settings.video_port`).
+- On connect, client's first line: `AUTH <token>\n` — must match
+  `settings.pairing_token`, else the connection is otherwise unusable
+  (no video, no accepted commands — see `_handle_line`, which silently
+  ignores anything before/besides the recognized command set; there is
+  no explicit auth rejection response, an unauthenticated client just
+  never gets anything back).
+- Inbound commands (newline-terminated ASCII): `START`, `STOP`,
+  `LOCK_START`, `PING`. Anything else is ignored, not errored.
+- Outbound status lines: `REC_ON`, `REC_OFF`, `ARMED`, `PONG`, and
+  `STATE <token>` (see below).
+- `STATE <token>\n` — `<token>` is exactly one of `CONNECTED` (streaming,
+  not live), `LIVE_NODATA` (live, no pose packet in the last
+  `POSE_TIMEOUT_S` = 1.5s), or `LIVE` (live and receiving) — computed by
+  the shared `_live_state_token()` helper, the same one the panel's
+  traffic light uses, so the two can never disagree. There is
+  deliberately no `DISCONNECTED` token: that state is already fully
+  conveyed by the TCP connection itself dropping. Sent from
+  `_drain_commands` (main thread only — never from `_accept_loop`/
+  `_client_reader` in `video_channel.py`, which run on background
+  threads and must not touch `settings.*`/`bpy`), on two independent
+  triggers, checked every tick regardless of `is_live`: (1) the token
+  changed since the last one sent (`self._last_sent_state`), or (2)
+  `video_server.client_count` increased since last tick
+  (`self._last_client_count`) — this second trigger is what lets a
+  phone that reconnects mid-session to an already-live, already-steady
+  Blender learn the current state immediately rather than wait for the
+  next transition that may never come. Not gated by
+  `remote_control_enabled` or `video_enabled` (mirrors
+  `phone_connected`/`pose_receiving`). No `STATE` line is sent from
+  `_finish()` on Disconnect — the socket closing is itself the signal.
+- Outbound video frames, interleaved with status lines on the same
+  socket: 4-byte big-endian unsigned length prefix, then exactly that
+  many bytes of JPEG. Distinguish by peeking the first byte (status
+  lines start with a printable ASCII character; a length prefix's
+  first byte is `0` for any realistic frame size).
+- `remote_control_enabled` gates whether `START`/`STOP` from the phone
+  are honored; `LOCK_START`/`PING` are always honored.
+- `STOP` while `is_recording` only flips `is_recording` off and sends
+  `REC_OFF` — it deliberately does **not** auto-bake to NLA. An earlier
+  version called `bpy.ops.anim.cam_link_bake_to_nla()` here so a
+  phone-stopped take couldn't end up as a "dangling" unbaked Action;
+  that was removed because it committed the take to an NLA strip under
+  whatever `active_take_name`/`take_blend_type` happened to already be
+  set, with no chance to review first. Stopping from the phone and
+  stopping from the panel toggle now behave identically either way:
+  the take sits as a plain active Action until `anim.cam_link_bake_to_nla`
+  is invoked explicitly (panel button or scripted).
+
+### Pairing QR
+```
+camlink://<ip>:<pose_port>:<video_port>?t=<token>
+```
+Generated by `WM_OT_camlink_show_qr` via
+`video_channel.pairing_qr_png_bytes()`, written to a temp PNG and
+opened with the OS's default viewer (`bpy.ops.wm.path_open`).
+
+## `CamLinkProSettings` (PropertyGroup, `context.scene.cam_link_pro`)
+
+| Property | Type | Default | Meaning |
+|---|---|---|---|
+| `ip_address` | str | `"0.0.0.0"` | UDP bind interface |
+| `port` | int | `5005` | UDP pose port |
+| `target_camera` | Object (CAMERA poll) | none | driven camera; falls back to `scene.camera` |
+| `smoothing_factor` | float 0–1 | `0.8` | lerp factor, `current = current*f + incoming*(1-f)` |
+| `drive_location` | bool | `True` | gate: live stream (and Record Motion's keyframe_insert) writes X/Y/Z |
+| `drive_rotation` | bool | `True` | gate: live stream (and Record Motion's keyframe_insert) writes rotation_euler |
+| `is_streaming` | bool | `False` | sockets open (Connect/Disconnect) -- independent of whether the camera is driven |
+| `is_live` | bool | `False` | connected stream is actually driving the camera + recording allowed (Start/Stop Live Stream). Requires `is_streaming` |
+| `phone_connected` | bool | `False` | read-only, set every tick from `video_server.client_count > 0`; only meaningful if `video_enabled` |
+| `pose_receiving` | bool | `False` | read-only, set every tick: a valid pose packet parsed within the last `WM_OT_camera_stream_server.POSE_TIMEOUT_S` (1.5s) — decays, doesn't require a packet on the exact current tick |
+| `is_recording` | bool | `False` | currently baking live values to keyframes |
+| `active_take_name` | str | `"Take_01"` | name for next NLA bake |
+| `take_blend_type` | enum | `REPLACE` | `REPLACE`\|`ADD`\|`SUBTRACT`\|`MULTIPLY`\|`COMBINE` — `NlaStrip.blend_type` used by the next bake |
+| `video_port` | int | `5006` | TCP video/command port |
+| `video_enabled` | bool | `False` | run the JPEG monitor stream |
+| `video_fps` | int 5–30 | `15` | capture throttle, independent of the 60Hz pose tick |
+| `remote_control_enabled` | bool | `True` | honor phone `START`/`STOP` |
+| `pairing_token` | str | `""` (generated on demand) | required `AUTH` value |
+| `is_armed` | bool | `False` | true after `LOCK_START` |
+
+## Operators
+
+| bl_idname | Class | Does |
+|---|---|---|
+| `wm.camera_stream_server` | `WM_OT_camera_stream_server` | Connect/Disconnect. Modal: opens UDP socket (+ TCP video server if enabled), 60Hz timer (`TIMER_INTERVAL = 1/60`), resets `is_live`/`phone_connected`/`pose_receiving` to False on connect. Drains/tracks pose every tick regardless of `is_live` (for status); only writes to the camera and allows recording when `is_live` is True. `_finish()` (disconnect) also forces `is_live`/`phone_connected`/`pose_receiving` back to False |
+| `wm.cam_link_toggle_live` | `WM_OT_camlink_toggle_live` | Start/Stop Live Stream. Non-modal, touches no socket -- just flips `is_live`; refuses (`CANCELLED`) if `is_streaming` is False. Turning live off also forces `is_recording` False |
+| `anim.cam_link_bake_to_nla` | `ANIM_OT_bake_take_to_nla` | pushes the active Action (object transform + camera-data lens/sensor_width) into new NLA track(s) named `active_take_name`, blend type = `take_blend_type`, extrapolation `NOTHING`; clears the active action afterward |
+| `anim.cam_link_setup_delta_rig` | `ANIM_OT_camlink_setup_delta_rig` | see *Delta rig* below |
+| `wm.cam_link_new_token` | `WM_OT_camlink_new_token` | regenerates `pairing_token` |
+| `wm.cam_link_show_qr` | `WM_OT_camlink_show_qr` | writes + opens the pairing QR PNG |
+
+## The 60Hz apply loop (`_drain_and_apply`), exact order
+
+1. Drain the UDP socket fully (non-blocking); keep only the newest
+   datagram this tick — older ones in the same tick are discarded
+   unread.
+2. Parse the newest payload (or `None` if nothing arrived this tick).
+3. **Regardless of `is_live`:** if parsed successfully, stamp
+   `self.last_packet_wall_time = time.time()`. Every tick (parsed or
+   not), set `settings.pose_receiving = (now - last_packet_wall_time) <
+   POSE_TIMEOUT_S` (1.5s) — this is why Pose Receiving already reflects
+   real data before you ever go live. If nothing parsed, return here.
+4. Drop on `seq_id < last_packet_id`.
+5. Lerp `current_loc`/`current_rot_deg`/`current_focal`/
+   `current_sensor_width` toward the incoming values by
+   `smoothing_factor`. **This also runs regardless of `is_live`** — the
+   smoothing baseline stays warm while merely Connected, so the first
+   frame after going Live isn't a jump from a stale value.
+6. **If not `is_live`: return here.** Nothing below this line runs
+   unless the stream is live — Connect alone can never move the camera
+   or record.
+7. **If `drive_location`:** write `cam_obj.location.x/y/z` from the
+   lerped position. **If `drive_rotation`:** write
+   `cam_obj.rotation_euler` (degrees → radians) from the lerped
+   rotation. These are direct RNA property writes — they always win
+   over whatever an Action/NLA stack on the *same object* evaluated to
+   that redraw; there is no live "additive" mode for a single object
+   (see *Known limitation* below).
+8. Always write `cam_obj.data.lens` and `cam_obj.data.sensor_width`
+   from the lerped focal/sensor values (no gate for these — only
+   location/rotation are gated, and only while live).
+9. If `is_recording`: `_insert_keyframes()` — keys only the channels
+   `drive_location`/`drive_rotation` currently allow, always keys
+   `lens`/`sensor_width`, then advances `scene.frame_current` by 1.
+
+`_drain_commands` separately sets `settings.phone_connected =
+video_server.client_count > 0` every tick it runs (independent of
+`is_live`), and its `START` handler now requires both
+`remote_control_enabled` and `is_live` — a phone Start tap while merely
+Connected is silently ignored, same as a disabled remote-control
+toggle.
+
+`invoke()` seeds `current_loc`/`current_rot_deg` from the target
+camera's *actual current* `.location`/`.rotation_euler` at the moment
+streaming starts (evaluated value, e.g. from any existing animation on
+that frame) — not from Delta Transform, which is a separate matrix
+component this add-on never reads or writes.
+
+## Known limitation: no live "additive on the same object"
+
+"Add on top of an existing animation" is fundamentally an NLA/
+playback-time concept (`NlaStrip.blend_type`). The live 60Hz loop above
+always does an absolute RNA write, which is evaluated *after* any
+animation on that object for that redraw — so a hand-keyed or NLA'd
+animation on the *same* object the stream is driving will always be
+overwritten/fought with live, regardless of what blend type you later
+set on a baked NLA strip. Setting `take_blend_type = ADD` only affects
+how a *finished, baked* take composites during scene playback — it
+does not make the live stream itself additive, and does not give a
+correct WYSIWYG preview while recording.
+
+**The supported fix is `anim.cam_link_setup_delta_rig`**, not the
+`ADD` blend type: it splits the base animation onto a new parent Empty
+(created at the camera's current world transform, so nothing jumps),
+moves the camera's existing Action onto that Empty, resets the camera
+to `(0,0,0)` local, and parents the camera to the Empty. Ordinary
+Blender parent→child transform composition then combines the Empty's
+independently-evaluated base animation with the camera's live-driven
+local delta every frame — correctly, live, in the monitor preview, and
+while recording — because the add-on is no longer writing to the same
+object that carries the base animation.
+
+Preconditions enforced by the operator (returns `{'CANCELLED'}`
+otherwise, with a `self.report({'ERROR'}, ...)` explaining why):
+target camera must exist and be type `CAMERA`; must have no existing
+parent; must have no existing NLA tracks (both cases are left for
+manual setup rather than risked being reshuffled automatically).
+
+**Blender 4.4+ "layered actions" gotcha**, load-bearing if you ever
+touch this operator's action-moving code or write similar code
+elsewhere in this add-on: reassigning `some_id.animation_data.action =
+existing_action` alone is **not sufficient** to make it evaluate for
+the new owner — the new "layered" action model resolves channels by
+`AnimData.action_slot`, not by which ID happens to reference the
+action. Without also carrying `action_slot` across (or assigning one of
+`action.slots`), the target evaluates as if unanimated — frozen at
+whatever static value the properties held, with no runtime error. This
+is the same reason `ANIM_OT_bake_take_to_nla._push_down` guards
+`strip.action_slot` when pushing to NLA. Verified against Blender
+5.2.1 LTS via an isolated `--background` script;
+`bpy.types.Action.fcurves` does not exist directly in this API
+generation either — fcurves live under
+`action.layers[].strips[].channelbags[<slot>].fcurves`.
+
+## Known bug + fix: monitor capture JPEG failure
+
+Symptom: repeating console spam
+`Video monitor error: bpy_struct: item.attr = val: enum "JPEG" not
+found in ('FFMPEG')`, with `video_enabled` auto-flipping to `False`
+each time.
+
+Cause: `capture_frame_jpeg()` sets
+`scene.render.image_settings.file_format = "JPEG"` to grab a still.
+Blender 4.0+ added `ImageFormatSettings.media_type` (`IMAGE` \|
+`MULTI_LAYER_IMAGE` \| `VIDEO`); when a scene's output is configured for
+video, `file_format`'s own enum dynamically shrinks to just `FFMPEG`,
+so the JPEG assignment raises. Reproduced directly against Blender
+5.2.1: setting `media_type = 'VIDEO'` then `file_format = 'JPEG'`
+raises exactly this error; setting `media_type = 'IMAGE'` first makes
+it succeed.
+
+Fix (present as of this version): `capture_frame_jpeg()` now saves
+`media_type` (via `hasattr` guard for older Blender without the
+property), forces it to `IMAGE` before setting `file_format`, and
+restores it in the `finally` block — restoring `media_type` *before*
+`file_format`, since the previous `file_format` value may not be legal
+under the previous `media_type` until both are put back in the right
+order.
+
+If this error still appears after updating the source file on disk:
+Python already has the old module loaded in the running Blender
+process; editing `.py` files does not hot-reload a running add-on.
+Toggle the add-on off/on in Preferences, or restart Blender.
+
+## FAQ: "why does the scene appear to move when I move the phone?"
+
+Almost always expected behavior, not a bug — check before assuming
+otherwise:
+
+1. **If you're watching through the driven camera** (Camera View, or
+   the phone's own JPEG monitor overlay), every static object will
+   appear to shift/rotate opposite to the camera's motion. That is
+   optically identical to a real handheld camera: turn your head right
+   and the room visually slides left across your field of view — the
+   room never moved, you're just viewing from inside the moving
+   element. This is inherent to first-person camera footage, not
+   specific to this add-on.
+2. **To confirm the camera really is independent:** switch to an
+   outside 3D viewport (not Camera View — orbit around freely) and
+   watch the camera object/frustum icon itself glide around while other
+   objects (a Cube, a Light, etc.) sit still. If that's what you see,
+   everything is working correctly — the earlier "the world spins"
+   feeling was purely the first-person perspective effect in (1).
+3. **If, from that outside view, other objects genuinely move or
+   rotate together with the camera** (not just the camera itself),
+   that's a real issue, and the most likely cause is accidental
+   parenting: check the Outliner for anything nested under the
+   Camera object or under a rig Empty (e.g. one created by
+   `anim.cam_link_setup_delta_rig`) — this add-on only ever writes to
+   the single Target Camera object, so anything else moving must be
+   parented (directly or transitively) to something that is.
+4. Unrelated to either of the above: "Reset Origin" on the phone and
+   any Delta Transform set on the Blender camera are two independent
+   concepts that never interact — Reset Origin only changes what
+   numbers the phone computes before sending; it has no knowledge of,
+   and never touches, anything inside the Blender file.
+
+## Explicitly out of scope for this add-on
+
+- No iOS support anywhere in this system (the phone app is
+  Android/ARCore-only by design).
+- No reliability/retry layer on the pose UDP channel — packet loss is
+  intentionally invisible (next packet just arrives late).
+- This add-on must never be asked to modify the phone app's wire
+  contracts (pose packet shape, command set, QR string format) — those
+  are fixed by design; a phone-side change would break pairing without
+  a matching Blender-side change, and vice versa.
