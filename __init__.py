@@ -1008,6 +1008,14 @@ class WM_OT_camlink_show_qr_popup(Operator):
             fh.write(png)
 
         pcoll = _get_qr_preview_collection()
+        # ImagePreviewCollection.load() raises KeyError on a name that's
+        # already in the collection regardless of force_reload -- that flag
+        # only controls whether Blender re-reads pixels for an existing key,
+        # it doesn't bypass the "already registered" guard. Since this popup
+        # can be reopened after the token (and so the QR image) changed, the
+        # stale entry has to be dropped explicitly first.
+        if "qr" in pcoll:
+            del pcoll["qr"]
         pcoll.load("qr", path, "IMAGE", force_reload=True)
 
         self._ip = ip
