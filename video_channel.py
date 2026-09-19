@@ -114,6 +114,7 @@ class VideoCommandServer:
         self._listener = None
         self._accept_thread = None
         self._clients = []          # list[socket.socket], guarded by _lock
+        self._authed = set()        # subset of _clients that sent the right AUTH token
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
@@ -147,8 +148,11 @@ class VideoCommandServer:
 
     @property
     def client_count(self):
+        # Only authenticated clients count -- an unauthenticated socket
+        # sitting connected shouldn't read as "phone connected" or receive
+        # STATE/video, since it never proved it scanned the pairing QR.
         with self._lock:
-            return len(self._clients)
+            return len(self._authed)
 
     # -- accept + per-client reader -----------------------------------------
     def _accept_loop(self):
@@ -168,8 +172,16 @@ class VideoCommandServer:
     def _client_reader(self, conn):
         """One thread per client, only ever reading commands. Frames go out
         on a separate path (push_frame, called from the main thread) so a
-        slow or wedged client can't block frame capture for everyone."""
+        slow or wedged client can't block frame capture for everyone.
+
+        The first line from a fresh connection must be the pairing token
+        (`AUTH <token>`); the token itself used to be accepted-but-never-
+        actually-checked here, which meant any device on the same Wi-Fi that
+        opened this port could send START/STOP or watch the video feed
+        without ever having scanned the QR. Now a missing/wrong token drops
+        the connection immediately, before it's ever added to `_authed`."""
         buf = b""
+        authenticated = False
         try:
             conn.settimeout(1.0)
             while not self._stop.is_set():
@@ -184,32 +196,33 @@ class VideoCommandServer:
                 buf += chunk
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    self._handle_line(line)
+                    try:
+                        text = line.decode("utf-8").strip()
+                    except UnicodeDecodeError:
+                        continue
+                    if not text:
+                        continue
+
+                    if not authenticated:
+                        if text == f"AUTH {self.token}":
+                            authenticated = True
+                            with self._lock:
+                                self._authed.add(conn)
+                        else:
+                            return  # wrong/missing token on the first line -> drop it
+                        continue
+
+                    if text in _VALID_INBOUND:
+                        self.commands_in.put(text)
         finally:
             with self._lock:
                 if conn in self._clients:
                     self._clients.remove(conn)
+                self._authed.discard(conn)
             try:
                 conn.close()
             except OSError:
                 pass
-
-    def _handle_line(self, raw):
-        try:
-            text = raw.decode("utf-8").strip()
-        except UnicodeDecodeError:
-            return
-        if not text:
-            return
-
-        # First line from a fresh connection must be the pairing token.
-        # Everything else on that connection is trusted after that, same
-        # way a session cookie works -- we're not re-checking every line.
-        if text.startswith("AUTH "):
-            return  # token itself isn't queued as a command
-
-        if text in _VALID_INBOUND:
-            self.commands_in.put(text)
 
     # -- outbound video ------------------------------------------------------
     def push_frame(self, jpeg_bytes):
@@ -226,7 +239,7 @@ class VideoCommandServer:
     def _broadcast(self, jpeg_bytes):
         header = _LEN_STRUCT.pack(len(jpeg_bytes))
         with self._lock:
-            clients = list(self._clients)
+            clients = list(self._authed)
         for c in clients:
             try:
                 c.sendall(header + jpeg_bytes)
@@ -236,7 +249,7 @@ class VideoCommandServer:
     def send_status(self, text):
         line = (text + "\n").encode("utf-8")
         with self._lock:
-            clients = list(self._clients)
+            clients = list(self._authed)
         for c in clients:
             try:
                 c.sendall(line)
