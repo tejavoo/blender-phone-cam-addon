@@ -148,7 +148,7 @@ reflects whether a client has an open TCP video/command connection.
   Expect roughly 10–25fps in practice; the render+encode time is the
   bottleneck, not the network.
 - **Allow Remote Record Control** — lets the phone's own Record button
-  drive `is_recording`/`is_armed` here, in addition to this panel.
+  drive `is_recording` here, in addition to this panel.
 - **Token** — included in the pairing QR; a device must have scanned it
   (or been given it manually) to open the video feed or send record
   commands. Click the refresh icon to invalidate any QR shown so far.
@@ -245,8 +245,8 @@ this.
   position in metres and rotation in degrees, already in Blender's
   right-handed Z-up space and XYZ Euler order.
 - **Video + command (TCP, both directions):** phone sends
-  `AUTH <token>` on connect, then `START` / `STOP` / `LOCK_START` /
-  `PING`; Blender replies with `REC_ON` / `REC_OFF` / `ARMED` / `PONG` /
+  `AUTH <token>` on connect, then `START` / `STOP` / `PING`; Blender
+  replies with `REC_ON` / `REC_OFF` / `REMOTE_DISABLED` / `PONG` /
   `STATE <token>` and interleaves JPEG frames as a 4-byte big-endian
   length prefix followed by that many bytes of JPEG data.
   `STATE <token>` mirrors the panel's own Connect/Live traffic light —

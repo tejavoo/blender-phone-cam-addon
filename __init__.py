@@ -166,6 +166,17 @@ class CamLinkProSettings(PropertyGroup):
         default=False,
     )
 
+    phone_client_count: IntProperty(
+        name="Connected Clients",
+        description=(
+            "Read-only status: number of authenticated clients on the video/command "
+            "TCP channel (mirrors video_server.client_count). Updated live by the "
+            "modal server -- not meant to be set by hand"
+        ),
+        default=0,
+        min=0,
+    )
+
     pose_receiving: BoolProperty(
         name="Pose Receiving",
         description="Read-only status: a valid pose packet has arrived within the last ~1.5s. Updated live by the modal server -- not meant to be set by hand",
@@ -265,12 +276,6 @@ class CamLinkProSettings(PropertyGroup):
         default="",
     )
 
-    is_armed: BoolProperty(
-        name="Is Armed",
-        description="A start pose has been locked in; recording will begin from here",
-        default=False,
-    )
-
 
 # ------------------------------------------------------------------------
 # Modal Operator: UDP Streaming Server
@@ -343,6 +348,7 @@ class WM_OT_camera_stream_server(Operator):
         # even if these were left on from a previous session somehow.
         settings.is_live = False
         settings.phone_connected = False
+        settings.phone_client_count = 0
         settings.pose_receiving = False
 
         if settings.video_enabled:
@@ -510,11 +516,12 @@ class WM_OT_camera_stream_server(Operator):
             self._insert_keyframes(context, cam_obj, settings)
 
     def _drain_commands(self, context, settings):
-        """Applies Start/Stop/Lock-start commands that arrived from the phone.
-        Mirrors exactly what ticking the panel's own checkbox does, so the
-        two controls can never disagree about what state Blender is in."""
+        """Applies Start/Stop commands that arrived from the phone. Mirrors
+        exactly what ticking the panel's own checkbox does, so the two
+        controls can never disagree about what state Blender is in."""
         client_count = self.video_server.client_count
         settings.phone_connected = client_count > 0
+        settings.phone_client_count = client_count
 
         # STATE <token> (CONNECTED / LIVE_NODATA / LIVE) is sent on the
         # main thread here -- never from _accept_loop/_client_reader in
@@ -537,25 +544,27 @@ class WM_OT_camera_stream_server(Operator):
             if cmd == "PING":
                 self.video_server.send_status("PONG")
 
-            elif cmd == "LOCK_START":
-                settings.is_armed = True
-                self.video_server.send_status("ARMED")
-
             elif cmd == "START":
-                if not settings.remote_control_enabled or not settings.is_live:
+                if not settings.remote_control_enabled:
+                    # The phone has no other way to learn why its Record
+                    # tap did nothing, so it gets a status line instead of
+                    # pure silence -- a new addition to the wire contract,
+                    # coordinated with the phone app (see llms.txt).
+                    self.video_server.send_status("REMOTE_DISABLED")
+                    continue
+                if not settings.is_live:
                     # Recording without the stream being live would just
                     # bake whatever the camera's non-live transform already
                     # is, frame after frame -- not what a phone-side Record
-                    # tap means. Silently ignored, same as a disabled
-                    # remote-control toggle, rather than erroring back over
-                    # a status line the protocol doesn't have.
+                    # tap means. Silently ignored (remote control itself is
+                    # fine, the phone just needs to wait for Live).
                     continue
-                settings.is_armed = False
                 settings.is_recording = True
                 self.video_server.send_status("REC_ON")
 
             elif cmd == "STOP":
                 if not settings.remote_control_enabled:
+                    self.video_server.send_status("REMOTE_DISABLED")
                     continue
                 if settings.is_recording:
                     settings.is_recording = False
@@ -657,6 +666,7 @@ class WM_OT_camera_stream_server(Operator):
         settings.is_live = False
         settings.is_recording = False
         settings.phone_connected = False
+        settings.phone_client_count = 0
         settings.pose_receiving = False
 
         return {"FINISHED"}
@@ -898,7 +908,7 @@ class WM_OT_camlink_new_token(Operator):
     def execute(self, context):
         settings = context.scene.cam_link_pro
         settings.pairing_token = video_channel.new_pairing_token()
-        self.report({"INFO"}, "New pairing token generated")
+        self.report({"INFO"}, "New pairing token generated -- re-scan the QR on the phone")
         return {"FINISHED"}
 
 
@@ -1148,11 +1158,13 @@ class VIEW3D_PT_cam_link_pro(Panel):
                 text="Pose: Receiving" if settings.pose_receiving else "Pose: No data",
                 icon="CHECKMARK" if settings.pose_receiving else "CANCEL",
             )
-            if settings.video_enabled:
-                detail_row.label(
-                    text="Phone: Connected" if settings.phone_connected else "Phone: Not connected",
-                    icon="CHECKMARK" if settings.phone_connected else "CANCEL",
-                )
+            # Shown regardless of video_enabled: this is the same
+            # video/command TCP connection either way, and a user may want
+            # to know a phone is connected even with the monitor off.
+            detail_row.label(
+                text="Phone: Connected" if settings.phone_connected else "Phone: Not connected",
+                icon="CHECKMARK" if settings.phone_connected else "CANCEL",
+            )
 
         connect_row = box.row()
         connect_label = "Disconnect" if settings.is_streaming else "Connect"
@@ -1203,6 +1215,12 @@ class VIEW3D_PT_cam_link_pro(Panel):
             box.prop(settings, "video_fps", slider=True)
         box.prop(settings, "remote_control_enabled")
 
+        # A blank token would just show an empty field the user has to
+        # remember to click "New Pairing Token" for -- generate one up
+        # front instead, same call the refresh button already makes.
+        if not settings.pairing_token:
+            settings.pairing_token = video_channel.new_pairing_token()
+
         token_row = box.row(align=True)
         token_row.prop(settings, "pairing_token", text="Token")
         token_row.operator(WM_OT_camlink_new_token.bl_idname, text="", icon="FILE_REFRESH")
@@ -1212,7 +1230,15 @@ class VIEW3D_PT_cam_link_pro(Panel):
         qr_row.operator(WM_OT_camlink_show_qr_popup.bl_idname, text="", icon="IMAGE_DATA")
 
         if settings.video_enabled:
-            box.label(text="Client count and status: see the System Console", icon="CONSOLE")
+            box.label(
+                text=f"Clients connected: {settings.phone_client_count}",
+                icon="CHECKMARK" if settings.phone_client_count else "CANCEL",
+            )
+            if settings.phone_client_count > 1:
+                box.label(
+                    text="Multiple devices connected -- generate a new token if unexpected",
+                    icon="ERROR",
+                )
 
         # --- Section 6: Help & Docs -----------------------------------------
         box = layout.box()

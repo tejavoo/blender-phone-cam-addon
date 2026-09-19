@@ -61,9 +61,9 @@ from . import qr_gen
 _LEN_STRUCT = struct.Struct(">I")
 
 # Commands are short newline-delimited text lines, sent either direction:
-#   phone -> Blender : START | STOP | LOCK_START | PING
-#   Blender -> phone  : REC_ON | REC_OFF | ARMED | PONG
-_VALID_INBOUND = {"START", "STOP", "LOCK_START", "PING"}
+#   phone -> Blender : START | STOP | PING
+#   Blender -> phone  : REC_ON | REC_OFF | REMOTE_DISABLED | PONG
+_VALID_INBOUND = {"START", "STOP", "PING"}
 
 
 def new_pairing_token():

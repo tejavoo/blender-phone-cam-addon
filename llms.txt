@@ -78,10 +78,17 @@ Single persistent connection, port `5006` default
   ignores anything before/besides the recognized command set; there is
   no explicit auth rejection response, an unauthenticated client just
   never gets anything back).
-- Inbound commands (newline-terminated ASCII): `START`, `STOP`,
-  `LOCK_START`, `PING`. Anything else is ignored, not errored.
-- Outbound status lines: `REC_ON`, `REC_OFF`, `ARMED`, `PONG`, and
-  `STATE <token>` (see below).
+- Inbound commands (newline-terminated ASCII): `START`, `STOP`, `PING`.
+  Anything else is ignored, not errored. (`LOCK_START` used to be valid
+  here too, back when the phone had a "Lock Start" toggle; that feature
+  was removed from the phone app, so `LOCK_START` is no longer recognized
+  and `is_armed`/`ARMED` are gone entirely.)
+- Outbound status lines: `REC_ON`, `REC_OFF`, `REMOTE_DISABLED`, `PONG`,
+  and `STATE <token>` (see below). `REMOTE_DISABLED` is sent in place of
+  silently ignoring a `START`/`STOP` when `remote_control_enabled` is
+  off, so the phone has something to react to instead of a no-op Record
+  tap -- this is a new addition to the wire contract (coordinate with
+  the phone app before relying on it there).
 - `STATE <token>\n` — `<token>` is exactly one of `CONNECTED` (streaming,
   not live), `LIVE_NODATA` (live, no pose packet in the last
   `POSE_TIMEOUT_S` = 1.5s), or `LIVE` (live and receiving) — computed by
@@ -108,7 +115,8 @@ Single persistent connection, port `5006` default
   lines start with a printable ASCII character; a length prefix's
   first byte is `0` for any realistic frame size).
 - `remote_control_enabled` gates whether `START`/`STOP` from the phone
-  are honored; `LOCK_START`/`PING` are always honored.
+  are honored (a `START`/`STOP` dropped for this reason sends
+  `REMOTE_DISABLED` back); `PING` is always honored.
 - `STOP` while `is_recording` only flips `is_recording` off and sends
   `REC_OFF` — it deliberately does **not** auto-bake to NLA. An earlier
   version called `bpy.ops.anim.cam_link_bake_to_nla()` here so a
@@ -140,7 +148,8 @@ opened with the OS's default viewer (`bpy.ops.wm.path_open`).
 | `drive_rotation` | bool | `True` | gate: live stream (and Record Motion's keyframe_insert) writes rotation_euler |
 | `is_streaming` | bool | `False` | sockets open (Connect/Disconnect) -- independent of whether the camera is driven |
 | `is_live` | bool | `False` | connected stream is actually driving the camera + recording allowed (Start/Stop Live Stream). Requires `is_streaming` |
-| `phone_connected` | bool | `False` | read-only, set every tick from `video_server.client_count > 0`; only meaningful if `video_enabled` |
+| `phone_connected` | bool | `False` | read-only, set every tick from `video_server.client_count > 0`. Only ever True if `video_enabled` was on at Connect time (that's what starts the TCP video/command server at all), but the panel now shows this status regardless of the current `video_enabled` toggle state |
+| `phone_client_count` | int | `0` | read-only, set every tick from `video_server.client_count` (already authenticated-only). Same `video_enabled`-at-Connect caveat as `phone_connected`. Panel shows a warning if this is `> 1` |
 | `pose_receiving` | bool | `False` | read-only, set every tick: a valid pose packet parsed within the last `WM_OT_camera_stream_server.POSE_TIMEOUT_S` (1.5s) — decays, doesn't require a packet on the exact current tick |
 | `is_recording` | bool | `False` | currently baking live values to keyframes |
 | `active_take_name` | str | `"Take_01"` | name for next NLA bake |
@@ -149,8 +158,7 @@ opened with the OS's default viewer (`bpy.ops.wm.path_open`).
 | `video_enabled` | bool | `False` | run the JPEG monitor stream |
 | `video_fps` | int 5–30 | `15` | capture throttle, independent of the 60Hz pose tick |
 | `remote_control_enabled` | bool | `True` | honor phone `START`/`STOP` |
-| `pairing_token` | str | `""` (generated on demand) | required `AUTH` value |
-| `is_armed` | bool | `False` | true after `LOCK_START` |
+| `pairing_token` | str | `""` (generated on demand -- both by the panel on first draw and by the Connect/QR operators) | required `AUTH` value |
 
 ## Operators
 
@@ -198,11 +206,13 @@ opened with the OS's default viewer (`bpy.ops.wm.path_open`).
    `lens`/`sensor_width`, then advances `scene.frame_current` by 1.
 
 `_drain_commands` separately sets `settings.phone_connected =
-video_server.client_count > 0` every tick it runs (independent of
-`is_live`), and its `START` handler now requires both
-`remote_control_enabled` and `is_live` — a phone Start tap while merely
-Connected is silently ignored, same as a disabled remote-control
-toggle.
+video_server.client_count > 0` and `settings.phone_client_count =
+video_server.client_count` every tick it runs (independent of
+`is_live`). Its `START` handler requires `remote_control_enabled` (else
+`REMOTE_DISABLED` is sent back) and, separately, `is_live` (silently
+ignored, no status line — merely Connected isn't enough to record even
+with remote control allowed). `STOP` only checks `remote_control_enabled`
+(same `REMOTE_DISABLED` reply if off).
 
 `invoke()` seeds `current_loc`/`current_rot_deg` from the target
 camera's *actual current* `.location`/`.rotation_euler` at the moment
