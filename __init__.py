@@ -26,6 +26,7 @@ import math
 import time
 
 import bpy
+import bpy.utils.previews
 from bpy.props import (
     StringProperty,
     IntProperty,
@@ -944,6 +945,79 @@ class WM_OT_camlink_show_qr(Operator):
         return {"FINISHED"}
 
 
+# Custom-icon preview collection backing the in-Blender QR popup below. Kept
+# as a module-level singleton (rather than on the operator instance) because
+# Blender frees preview collections independently of operator lifetime --
+# this must be torn down explicitly in unregister() or it leaks.
+_qr_preview_collection = None
+
+
+def _get_qr_preview_collection():
+    global _qr_preview_collection
+    if _qr_preview_collection is None:
+        _qr_preview_collection = bpy.utils.previews.new()
+    return _qr_preview_collection
+
+
+class WM_OT_camlink_show_qr_popup(Operator):
+    """Shows the pairing QR as a popup inside Blender itself, for scanning
+    without alt-tabbing out to the OS image viewer. The OS-viewer version
+    (WM_OT_camlink_show_qr) stays the primary/most-reliable option since
+    Blender's preview icons cap out at a fairly low resolution."""
+
+    bl_idname = "wm.cam_link_show_qr_popup"
+    bl_label = "Show QR in Blender"
+    bl_description = "Show the phone-pairing QR code in a popup inside Blender"
+
+    _ip = ""
+    _port = 0
+    _video_port = 0
+
+    def execute(self, context):
+        return {"FINISHED"}
+
+    def invoke(self, context, event):
+        import os
+        import tempfile
+
+        settings = context.scene.cam_link_pro
+        if not settings.pairing_token:
+            settings.pairing_token = video_channel.new_pairing_token()
+
+        ip = video_channel.local_lan_ip()
+        try:
+            png = video_channel.pairing_qr_png_bytes(
+                ip, settings.port, settings.video_port, settings.pairing_token, scale=8
+            )
+        except ValueError as exc:
+            self.report({"ERROR"}, f"Could not build pairing QR: {exc}")
+            return {"CANCELLED"}
+
+        path = os.path.join(tempfile.gettempdir(), "cam_link_pro_pairing_qr_popup.png")
+        with open(path, "wb") as fh:
+            fh.write(png)
+
+        pcoll = _get_qr_preview_collection()
+        pcoll.load("qr", path, "IMAGE", force_reload=True)
+
+        self._ip = ip
+        self._port = settings.port
+        self._video_port = settings.video_port
+
+        return context.window_manager.invoke_popup(self, width=300)
+
+    def draw(self, context):
+        layout = self.layout
+        pcoll = _get_qr_preview_collection()
+        qr = pcoll.get("qr")
+        if qr is not None:
+            layout.template_icon(icon_value=qr.icon_id, scale=15)
+
+        settings = context.scene.cam_link_pro
+        layout.label(text=f"{self._ip}:{self._port}/{self._video_port}")
+        layout.label(text=f"Token: {settings.pairing_token}")
+
+
 def _open_bundled_doc(operator, filename):
     """Shared by the two doc-opening operators below: resolves a file
     sitting next to this add-on's own __init__.py (so it's whatever
@@ -1133,8 +1207,9 @@ class VIEW3D_PT_cam_link_pro(Panel):
         token_row.prop(settings, "pairing_token", text="Token")
         token_row.operator(WM_OT_camlink_new_token.bl_idname, text="", icon="FILE_REFRESH")
 
-        qr_row = box.row()
+        qr_row = box.row(align=True)
         qr_row.operator(WM_OT_camlink_show_qr.bl_idname, icon="LIGHT")
+        qr_row.operator(WM_OT_camlink_show_qr_popup.bl_idname, text="", icon="IMAGE_DATA")
 
         if settings.video_enabled:
             box.label(text="Client count and status: see the System Console", icon="CONSOLE")
@@ -1157,6 +1232,7 @@ classes = (
     ANIM_OT_camlink_setup_delta_rig,
     WM_OT_camlink_new_token,
     WM_OT_camlink_show_qr,
+    WM_OT_camlink_show_qr_popup,
     WM_OT_camlink_open_readme,
     WM_OT_camlink_open_llms_txt,
     VIEW3D_PT_cam_link_pro,
@@ -1180,6 +1256,11 @@ def unregister():
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+
+    global _qr_preview_collection
+    if _qr_preview_collection is not None:
+        bpy.utils.previews.remove(_qr_preview_collection)
+        _qr_preview_collection = None
 
 
 if __name__ == "__main__":
