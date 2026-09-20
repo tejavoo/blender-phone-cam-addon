@@ -148,8 +148,8 @@ opened with the OS's default viewer (`bpy.ops.wm.path_open`).
 | `drive_rotation` | bool | `True` | gate: live stream (and Record Motion's keyframe_insert) writes rotation_euler |
 | `is_streaming` | bool | `False` | sockets open (Connect/Disconnect) -- independent of whether the camera is driven |
 | `is_live` | bool | `False` | connected stream is actually driving the camera + recording allowed (Start/Stop Live Stream). Requires `is_streaming` |
-| `phone_connected` | bool | `False` | read-only, set every tick from `video_server.client_count > 0`. Only ever True if `video_enabled` was on at Connect time (that's what starts the TCP video/command server at all), but the panel now shows this status regardless of the current `video_enabled` toggle state |
-| `phone_client_count` | int | `0` | read-only, set every tick from `video_server.client_count` (already authenticated-only). Same `video_enabled`-at-Connect caveat as `phone_connected`. Panel shows a warning if this is `> 1` |
+| `phone_connected` | bool | `False` | read-only, set every tick from `video_server.client_count > 0`. The TCP video/command server now opens on every Connect regardless of `video_enabled` (only frame *capture* is gated on that toggle), so this reflects real phone pairing state independent of the monitor being on |
+| `phone_client_count` | int | `0` | read-only, set every tick from `video_server.client_count` (already authenticated-only). Same Connect-independent-of-`video_enabled` behavior as `phone_connected`. Panel shows a warning if this is `> 1` |
 | `pose_receiving` | bool | `False` | read-only, set every tick: a valid pose packet parsed within the last `WM_OT_camera_stream_server.POSE_TIMEOUT_S` (1.5s) — decays, doesn't require a packet on the exact current tick |
 | `is_recording` | bool | `False` | currently baking live values to keyframes |
 | `active_take_name` | str | `"Take_01"` | name for next NLA bake |

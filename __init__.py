@@ -306,8 +306,9 @@ class WM_OT_camera_stream_server(Operator):
     current_focal = 50.0
     current_sensor_width = 36.0
 
-    # Video/command channel. None until (and unless) video_enabled is on --
-    # the pose stream works exactly as before if this is never touched.
+    # Video/command channel. Opened on every Connect (see invoke()) so
+    # pairing and remote record control work whether or not the JPEG
+    # monitor itself is enabled; stays None only if the port failed to bind.
     video_server = None
     _video_tick_counter = 0
 
@@ -351,19 +352,24 @@ class WM_OT_camera_stream_server(Operator):
         settings.phone_client_count = 0
         settings.pose_receiving = False
 
-        if settings.video_enabled:
-            if not settings.pairing_token:
-                settings.pairing_token = video_channel.new_pairing_token()
-            try:
-                self.video_server = video_channel.VideoCommandServer(
-                    settings.ip_address, settings.video_port, settings.pairing_token
-                )
-                self.video_server.start()
-            except OSError as exc:
-                self.report({"ERROR"}, f"Video/command port failed to open: {exc}")
-                self.video_server = None
-                # Pose streaming still works without the monitor -- don't
-                # abort the whole operator over this.
+        # Always opens, independent of video_enabled: this is the same TCP
+        # channel the phone uses for pairing and remote record control, not
+        # just the JPEG monitor feed, so a phone should be able to pair and
+        # start/stop recording even with "Enable Live Monitor" off. Only
+        # frame *capture* (_maybe_capture_frame, gated on video_enabled in
+        # modal()) is actually tied to that checkbox.
+        if not settings.pairing_token:
+            settings.pairing_token = video_channel.new_pairing_token()
+        try:
+            self.video_server = video_channel.VideoCommandServer(
+                settings.ip_address, settings.video_port, settings.pairing_token
+            )
+            self.video_server.start()
+        except OSError as exc:
+            self.report({"ERROR"}, f"Video/command port failed to open: {exc}")
+            self.video_server = None
+            # Pose streaming still works without the monitor -- don't
+            # abort the whole operator over this.
         self._video_tick_counter = 0
 
         wm = context.window_manager
