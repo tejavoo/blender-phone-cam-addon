@@ -525,6 +525,19 @@ class WM_OT_camera_stream_server(Operator):
         """Applies Start/Stop commands that arrived from the phone. Mirrors
         exactly what ticking the panel's own checkbox does, so the two
         controls can never disagree about what state Blender is in."""
+        # Keeps the running server's accepted token in sync with whatever
+        # the panel currently shows. video_server.token used to only ever
+        # be set once, at Connect (invoke()) time -- if the token was
+        # regenerated afterward (New Pairing Token, or the panel
+        # auto-generating one after a reload reset it to blank), the
+        # server kept honoring the old value while the panel/QR displayed
+        # the new one, so a freshly-scanned QR would get silently rejected
+        # until the user did a full Disconnect/Connect. A plain string
+        # attribute swap is safe to do from the main thread here: the
+        # background _client_reader threads only ever read self.token at
+        # the moment an AUTH line arrives, never cache it.
+        self.video_server.token = settings.pairing_token
+
         client_count = self.video_server.client_count
         settings.phone_connected = client_count > 0
         settings.phone_client_count = client_count
